@@ -1,5 +1,5 @@
 /**
- * MissedTheApex F1 News (v1)
+ * MissedTheApex F1 News (v1 - higher-resolution embed images)
  * Trusted RSS feeds, Discord headline/link alerts, persistent duplicate tracking.
  * Uses the SAME PostgreSQL-backed client.db.get/set interface as FIA documents.
  * npm install rss-parser
@@ -122,6 +122,28 @@ function safeImageUrl(value, baseUrl) {
   }
 }
 
+/**
+ * Some publishers' RSS feeds contain deliberately small thumbnails.
+ * The BBC's image CDN also serves wider variants at the same asset path.
+ * Upgrade only that documented URL pattern; never guess URL formats for
+ * other publishers.
+ */
+function preferLargeImage(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.hostname.toLowerCase() === 'ichef.bbci.co.uk') {
+      url.pathname = url.pathname.replace(
+        /^\/ace\/(standard|ws)\/(?:120|240|320|480)\//,
+        '/ace/$1/1024/'
+      );
+    }
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
 function feedImage(item, articleUrl) {
   const candidates = [];
   if (item.enclosure?.url && /^image\//i.test(item.enclosure.type || '')) {
@@ -152,7 +174,9 @@ function feedImage(item, articleUrl) {
       candidates.push(img.attr('data-src'), img.attr('src'));
     }
   }
-  return candidates.map(value => safeImageUrl(value, articleUrl)).find(Boolean) || null;
+  return candidates
+    .map(value => preferLargeImage(safeImageUrl(value, articleUrl)))
+    .find(Boolean) || null;
 }
 
 function approvedPublisherUrl(value, source) {
@@ -223,7 +247,7 @@ async function articleOpenGraphImage(article) {
       || $('meta[property="og:image"]').first().attr('content')
       || $('meta[name="twitter:image"]').first().attr('content')
       || $('meta[name="twitter:image:src"]').first().attr('content');
-    return safeImageUrl(image, approved);
+    return preferLargeImage(safeImageUrl(image, approved));
   }
   return null;
 }
@@ -394,13 +418,18 @@ export async function checkF1News(bot) {
         duplicates++;
         continue;
       }
-      // Fetch the publisher's social-preview image only for a new post;
-      // never revisit articles already seen in PostgreSQL.
-      if (!article.imageUrl) {
+      // Large previews, not tiny RSS thumbnails:
+      // - BBC's RSS image has already been upgraded to its 1024px variant.
+      // - For other publishers, prefer the article's Open Graph image.
+      //   Only fetch article metadata for NEW posts (not every feed scan).
+      // - If the article blocks metadata or omits an image, retain the RSS
+      //   image as a fallback rather than dropping the notification.
+      if (!article.imageUrl || article.source.id !== 'bbc') {
         try {
-          article.imageUrl = await articleOpenGraphImage(article);
+          const pageImage = await articleOpenGraphImage(article);
+          if (pageImage) article.imageUrl = pageImage;
         } catch (error) {
-          logger.info(`[F1 News] Image not available from ${article.source.name}: ${error.message}`);
+          logger.info(`[F1 News] Higher-resolution image unavailable from ${article.source.name}; using RSS fallback: ${error.message}`);
         }
       }
       // Send before recording success. A crash between both operations may
