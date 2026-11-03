@@ -1,4 +1,3 @@
-
 /**
  * MissedTheApex F1 News (v1)
  * Trusted RSS feeds, Discord headline/link alerts, persistent duplicate tracking.
@@ -6,17 +5,27 @@
  * npm install rss-parser
  */
 import Parser from 'rss-parser';
+import { load } from 'cheerio';
 import { createHash } from 'node:crypto';
 import { EmbedBuilder } from 'discord.js';
 import { logger } from '../utils/logger.js';
 
-const parser = new Parser();
+const parser = new Parser({
+  // Not every publisher includes these. We also check Open Graph image metadata
+  // for a newly discovered article when an RSS image isn't available.
+  customFields: {
+    item: [
+      ['media:content', 'mediaContent', { keepArray: true }],
+      ['media:thumbnail', 'mediaThumbnail', { keepArray: true }],
+    ],
+  },
+});
 const HISTORY_KEY = 'cache:f1news:v1:seen';
 const ACTIVE_KEY = 'cache:f1news:v1:activated';
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ARTICLE_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_POSTS_PER_CHECK = 8;
-const RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
+const RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000; // At least one hour after HTTP 429
 let checking = false;
 
 // A publisher can supply Retry-After as seconds or an HTTP date.
@@ -35,6 +44,7 @@ class RateLimitError extends Error {
     this.retryAfterMs = Math.max(RATE_LIMIT_COOLDOWN_MS, retryAfterMilliseconds(retryAfter));
   }
 }
+
 
 // Explicit allowlist. These sites publish news and analysis; their RSS headlines
 // are NOT automatically verified facts or FIA confirmations.
@@ -98,6 +108,133 @@ function labelFor(item) {
   return 'REPORTING';
 }
 
+// Discord embeds an image by URL; we do not download or rehost image files.
+// An HTTPS image link is not guaranteed to work: some publishers block embeds.
+function safeImageUrl(value, baseUrl) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim(), baseUrl);
+    if (url.protocol !== 'https:' || url.username || url.password || url.href.length > 2048) return null;
+    if (/\.svg(?:$|[?#])/i.test(url.pathname)) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function feedImage(item, articleUrl) {
+  const candidates = [];
+  if (item.enclosure?.url && /^image\//i.test(item.enclosure.type || '')) {
+    candidates.push(item.enclosure.url);
+  }
+  // rss-parser may omit XML attributes on media:* fields, depending on feed.
+  // That is why the separate Open Graph fallback is important.
+  for (const entry of [item.mediaContent, item.mediaThumbnail]) {
+    for (const media of Array.isArray(entry) ? entry : entry ? [entry] : []) {
+      const attrs = media?.$ || media;
+      const kind = String(attrs?.type || attrs?.medium || '').toLowerCase();
+      if (attrs?.url && (kind === '' || kind === 'image' || kind.startsWith('image/'))) {
+        candidates.push(attrs.url);
+      }
+      for (const thumb of Array.isArray(media?.['media:thumbnail'])
+        ? media['media:thumbnail'] : media?.['media:thumbnail'] ? [media['media:thumbnail']] : []) {
+        if (thumb?.$?.url || thumb?.url) candidates.push(thumb?.$?.url || thumb?.url);
+      }
+    }
+  }
+  // Some feeds place the article thumbnail in their HTML description.
+  // Only consider reasonably sized images, not tracking pixels or icons.
+  const html = item['content:encoded'] || item.content || '';
+  if (typeof html === 'string' && html.includes('<img')) {
+    const $ = load(html);
+    const img = $('figure img').first().length ? $('figure img').first() : $('img').first();
+    if (img.length && Number(img.attr('width') || 250) >= 120 && Number(img.attr('height') || 150) >= 80) {
+      candidates.push(img.attr('data-src'), img.attr('src'));
+    }
+  }
+  return candidates.map(value => safeImageUrl(value, articleUrl)).find(Boolean) || null;
+}
+
+function approvedPublisherUrl(value, source) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== 'https:' || url.username || url.password ||
+        !source.domains.some(domain => host === domain || host.endsWith(`.${domain}`))) return null;
+    url.hash = '';
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+// Read only a small amount of HTML. RSS checks remain separate; this happens
+// only when we are about to post a new article without an RSS image.
+async function readLimitedHtml(response, limit = 1_500_000) {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        return '';
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+async function articleOpenGraphImage(article) {
+  // Redirects are followed only if the next URL is still on the publisher's
+  // allowlisted domains. This avoids requesting arbitrary URLs from RSS data.
+  let url = article.url;
+  for (let i = 0; i < 3; i++) {
+    const approved = approvedPublisherUrl(url, article.source);
+    if (!approved) return null;
+    const response = await fetch(approved, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(7000),
+      headers: {
+        'user-agent': 'MissedTheApex-F1News/1.1 (article preview metadata)',
+        accept: 'text/html,application/xhtml+xml',
+      },
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) return null;
+      url = new URL(location, approved).href;
+      continue;
+    }
+    if (!response.ok) return null; // Including 403/429: no retries or bypasses
+    const type = response.headers.get('content-type') || '';
+    if (!/text\/html|application\/xhtml\+xml/i.test(type)) return null;
+    const html = await readLimitedHtml(response);
+    if (!html) return null;
+    const $ = load(html);
+    const image = $('meta[property="og:image:secure_url"]').first().attr('content')
+      || $('meta[property="og:image"]').first().attr('content')
+      || $('meta[name="twitter:image"]').first().attr('content')
+      || $('meta[name="twitter:image:src"]').first().attr('content');
+    return safeImageUrl(image, approved);
+  }
+  return null;
+}
+
+// Optional, non-posting Codespaces test for an individual article.
+export async function previewArticleImage(articleUrl) {
+  const source = F1_NEWS_SOURCES.find(candidate => normaliseUrl(articleUrl, candidate));
+  if (!source) throw new Error('Article must be on an approved publisher domain');
+  return { source: source.name, imageUrl: await articleOpenGraphImage({ url: articleUrl, source }) };
+}
+
 async function readSource(source) {
   const response = await fetch(source.rss, {
     signal: AbortSignal.timeout(15000),
@@ -124,6 +261,7 @@ async function readSource(source) {
     return {
       url, title, source, id: sha256(url), headline: titleKey(title),
       label: labelFor(item),
+      imageUrl: feedImage(item, url),
       date: date && !Number.isNaN(date.getTime()) ? date : null,
     };
   }).filter(Boolean);
@@ -153,6 +291,7 @@ function makeEmbed(article) {
     .setURL(article.url)
     .setDescription('Read the full story using the headline link above.')
     .setFooter({ text: 'MissedTheApex News • Publisher reports are not official FIA confirmation' });
+  if (article.imageUrl) embed.setImage(article.imageUrl);
   if (article.date) embed.setTimestamp(article.date);
   return embed;
 }
@@ -254,6 +393,15 @@ export async function checkF1News(bot) {
         }
         duplicates++;
         continue;
+      }
+      // Fetch the publisher's social-preview image only for a new post;
+      // never revisit articles already seen in PostgreSQL.
+      if (!article.imageUrl) {
+        try {
+          article.imageUrl = await articleOpenGraphImage(article);
+        } catch (error) {
+          logger.info(`[F1 News] Image not available from ${article.source.name}: ${error.message}`);
+        }
       }
       // Send before recording success. A crash between both operations may
       // very occasionally duplicate a post on restart; see SETUP.md.
