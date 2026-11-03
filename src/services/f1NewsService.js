@@ -1,3 +1,4 @@
+
 /**
  * MissedTheApex F1 News (v1)
  * Trusted RSS feeds, Discord headline/link alerts, persistent duplicate tracking.
@@ -15,7 +16,25 @@ const ACTIVE_KEY = 'cache:f1news:v1:activated';
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ARTICLE_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_POSTS_PER_CHECK = 8;
+const RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
 let checking = false;
+
+// A publisher can supply Retry-After as seconds or an HTTP date.
+function retryAfterMilliseconds(value) {
+  if (!value) return 0;
+  const seconds = /^\s*\d+\s*$/.test(value) ? Number(value.trim()) : NaN;
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+class RateLimitError extends Error {
+  constructor(source, retryAfter) {
+    super(`HTTP 429 - ${source.name} has requested a cooldown`);
+    this.name = 'RateLimitError';
+    this.retryAfterMs = Math.max(RATE_LIMIT_COOLDOWN_MS, retryAfterMilliseconds(retryAfter));
+  }
+}
 
 // Explicit allowlist. These sites publish news and analysis; their RSS headlines
 // are NOT automatically verified facts or FIA confirmations.
@@ -87,6 +106,9 @@ async function readSource(source) {
       accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
     },
   });
+  if (response.status === 429) {
+    throw new RateLimitError(source, response.headers.get('retry-after'));
+  }
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const xml = await response.text();
   if (xml.length > 3_000_000) throw new Error('Unexpectedly large feed');
@@ -171,8 +193,16 @@ export async function checkF1News(bot) {
     let online = 0;
     const pending = [];
     for (const source of F1_NEWS_SOURCES) {
+      const cooldownKey = `cache:f1news:v1:cooldown:${source.id}`;
       try {
+        // Store cooldowns in PostgreSQL, not memory, so Railway restarts do
+        // not cause fresh requests while the publisher is rate-limiting us.
+        const cooldownUntil = Number(await bot.db.get(cooldownKey, 0)) || 0;
+        if (cooldownUntil > Date.now()) continue;
+
         const articles = await readSource(source);
+        // A successful fetch clears any previously expired cooldown.
+        if (cooldownUntil !== 0) await bot.db.set(cooldownKey, 0);
         online++;
         const seedKey = `cache:f1news:v1:source:${source.id}`;
         const seeded = await bot.db.get(seedKey, null);
@@ -187,7 +217,17 @@ export async function checkF1News(bot) {
           pending.push(...articles);
         }
       } catch (error) {
-        logger.warn(`[F1 News] ${source.name}: ${error.message}`);
+        if (error instanceof RateLimitError) {
+          const until = Date.now() + error.retryAfterMs;
+          try {
+            await bot.db.set(cooldownKey, until);
+            logger.warn(`[F1 News] ${source.name}: HTTP 429. Pausing requests until ${new Date(until).toISOString()}.`);
+          } catch (dbError) {
+            logger.error(`[F1 News] Could not save ${source.name} cooldown:`, dbError);
+          }
+        } else {
+          logger.warn(`[F1 News] ${source.name}: ${error.message}`);
+        }
       }
     }
 
