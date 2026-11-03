@@ -18,6 +18,7 @@ import { initializeMusic } from './services/music/riffySetup.js';
 import { shutdownMusic } from './services/music/playerHandler.js';
 import { checkFiaDocuments } from './services/fiaDocumentsService.js';
 import { checkF1News } from './services/f1NewsService.js';
+import { setupF1TeamSelector } from './services/f1TeamSelectorService.js';
 import pkg from '../package.json' with { type: 'json' };
 import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
 
@@ -117,6 +118,7 @@ class TitanBot extends Client {
       }
       
       this.setupCronJobs();
+      setupF1TeamSelector(this);
     } catch (error) {
       logger.error('Failed to start bot:', error);
       process.exit(1);
