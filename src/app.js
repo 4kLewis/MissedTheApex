@@ -17,6 +17,7 @@ import { runSafeTask, handleTaskError, ErrorCodes } from './utils/errorHandler.j
 import { initializeMusic } from './services/music/riffySetup.js';
 import { shutdownMusic } from './services/music/playerHandler.js';
 import { checkFiaDocuments } from './services/fiaDocumentsService.js';
+import { checkF1News } from './services/f1NewsService.js';
 import pkg from '../package.json' with { type: 'json' };
 import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
 
@@ -283,6 +284,17 @@ setupCronJobs() {
             () => checkTwitchStreams(this)
         )
     );
+
+    // Trusted F1 News - check every five minutes
+    if (process.env.F1_NEWS_ENABLED === 'true') {
+      cron.schedule(
+        '*/5 * * * *',
+        runSafeTask('f1_news_check', () => checkF1News(this))
+      );
+      void checkF1News(this).catch(err =>
+        logger.error('[F1 News] Initial check failed:', err)
+      );
+    }
 }
 
   async updateAllCounters() {
