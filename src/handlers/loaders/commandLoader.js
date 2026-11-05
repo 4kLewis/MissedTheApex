@@ -15,10 +15,28 @@ const COMMAND_COUNT_WARN_THRESHOLD = 90;
 const COMPACT_GIVEAWAYS = process.env.MTA_COMPACT_GIVEAWAYS === 'true';
 const LEGACY_GIVEAWAY_NAMES = new Set(['gcreate', 'gend', 'gdelete', 'greroll']);
 
+// Each group is separately reversible with a Railway environment variable.
+// Keep the original command modules loaded for the existing prefix handlers.
+const COMPACT_GROUPS = [
+    { flag: 'MTA_COMPACT_TOOLS', root: 'tools', legacy: new Set([
+        'baseconvert', 'calculate', 'countdown', 'embedbuilder', 'generatepassword',
+        'hexcolor', 'poll', 'randomuser', 'shorten', 'time', 'unixtime',
+    ]) },
+    { flag: 'MTA_COMPACT_FUN', root: 'fun', legacy: new Set(['fight', 'flip', 'roll']) },
+    { flag: 'MTA_COMPACT_UTILITY', root: 'utility', legacy: new Set([
+        'avatar', 'firstmsg', 'serverinfo', 'userinfo', 'weather',
+    ]) },
+];
+
 function shouldRegister(name) {
-    return COMPACT_GIVEAWAYS
-        ? !LEGACY_GIVEAWAY_NAMES.has(name)
-        : name !== 'giveaway';
+    if (COMPACT_GIVEAWAYS ? LEGACY_GIVEAWAY_NAMES.has(name) : name === 'giveaway') {
+        return false;
+    }
+    for (const group of COMPACT_GROUPS) {
+        const enabled = process.env[group.flag] === 'true';
+        if (enabled ? group.legacy.has(name) : name === group.root) return false;
+    }
+    return true;
 }
 
 function getSubcommandInfo(commandData) {
