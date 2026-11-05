@@ -3,6 +3,7 @@ import { Client, Collection, GatewayIntentBits } from 'discord.js';
 import { REST } from '@discordjs/rest';
 import express from 'express';
 import cron from 'node-cron';
+import { startF1ChampionshipTracker } from './services/f1ChampionshipService.js';
 
 import config from './config/application.js';
 import { initializeDatabase } from './utils/database.js';
@@ -118,6 +119,7 @@ class TitanBot extends Client {
       }
       
       this.setupCronJobs();
+      startF1ChampionshipTracker(this);
       setupF1TeamSelector(this);
     } catch (error) {
       logger.error('Failed to start bot:', error);
