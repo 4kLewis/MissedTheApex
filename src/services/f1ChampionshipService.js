@@ -7,9 +7,10 @@ import cron from 'node-cron';
 import { EmbedBuilder } from 'discord.js';
 import { logger } from '../utils/logger.js';
 import { fetchFiaDocuments } from './fiaDocumentsService.js';
-import { buildSnapshot, standingsHash, selectRace, racePhase, boardText, isAllowedFiaPdf } from './f1ChampionshipCore.js';
+import { buildSnapshot, standingsHash, selectRace, racePhase, boardText, isAllowedFiaPdf, buildPublishedStandings } from './f1ChampionshipCore.js';
 
 const API = 'https://api.openf1.org';
+const JOLPICA = 'https://api.jolpi.ca/ergast/f1';
 const PREFIX = 'cache:f1championship:v1';
 const DEFAULT_YEAR = 2026;
 const DISCOVERY_INTERVAL = 20 * 60_000;
@@ -26,6 +27,8 @@ let tokenExpires = 0;
 let cooldownUntil = 0;
 let lastPostRacePoll = 0;
 let lastFiaLookup = 0;
+let lastPublishedPoll = 0;
+const PUBLISHED_POLL_MS = 30 * 60_000;
 
 const channelKey = channelId => `${PREFIX}:${channelId}:latest`;
 const boardKey = (channelId, sessionKey) => `${PREFIX}:${channelId}:${sessionKey}`;
@@ -81,6 +84,34 @@ async function openF1(path, retry = true) {
   return json;
 }
 
+async function jolpica(path) {
+  const response = await fetch(`${JOLPICA}/${path}`, {
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    headers: { accept: 'application/json', 'user-agent': 'MissedTheApex-standings/2.0' },
+  });
+  if (!response.ok) throw new Error(`Jolpica HTTP ${response.status} on /${path.split('?')[0]}`);
+  return response.json();
+}
+
+async function fetchPublished(year, { jget = jolpica, now = Date.now() } = {}) {
+  const [drivers, teams] = await Promise.all([
+    jget(`${year}/driverstandings.json`),
+    jget(`${year}/constructorstandings.json`),
+  ]);
+  // Naming the last round is optional. Failure must not hide the standings.
+  let eventName = '';
+  try {
+    const last = await jget(`${year}/last/results.json?limit=1`);
+    const race = last?.MRData?.RaceTable?.Races?.[0];
+    const round = Number(drivers?.MRData?.StandingsTable?.StandingsLists?.[0]?.round);
+    if (race && Number(race.round) === round) eventName = `${race.raceName} · Round ${round}`;
+  } catch (error) {
+    logger.debug(`[F1 Championship] Last-race name unavailable: ${safeHostError(error)}`);
+  }
+  return buildPublishedStandings({ driverPayload: drivers, teamPayload: teams,
+    eventName, year, at: now });
+}
+
 async function findRace(get = openF1, now = Date.now()) {
   if (!cachedSessions || now - sessionsAt > DISCOVERY_INTERVAL) {
     cachedSessions = await get(`sessions?year=${configuredYear()}`);
@@ -100,18 +131,22 @@ function matchingFiaDoc(doc, session) {
 }
 
 function makeEmbed(snapshot, type, state, now) {
-  const phase = racePhase(state.session, now);
+  const published = snapshot.source === 'jolpica';
+  const phase = published ? `CURRENT PUBLISHED STANDINGS · ROUND ${snapshot.round}` : racePhase(state.session, now);
   const confirmed = state.verified?.hash === standingsHash(snapshot);
   const status = confirmed ? 'FIA CROSS-CHECKED BY SERVER ADMIN' :
-    state.fiaDocUrl ? 'FIA DOCUMENT AVAILABLE · AWAITING REVIEW' : phase;
+    state.fiaDocUrl ? `${phase} · FIA PDF AVAILABLE FOR REVIEW` : phase;
   const standings = type === 'drivers' ? snapshot.drivers : snapshot.teams;
+  const text = published
+    ? standings.map(r => `\`${String(r.position).padStart(2)}\` **${r.name.replace(/[*_~>|]/g,'')}** — **${r.points}** pts`).join('\n').slice(0, 3900)
+    : boardText(standings);
   const embed = new EmbedBuilder()
-    .setColor(confirmed ? 0x228E68 : phase.startsWith('LIVE') ? 0xF1A722 : 0x387FDB)
+    .setColor(confirmed ? 0x228E68 : !published && phase.startsWith('LIVE') ? 0xF1A722 : 0x387FDB)
     .setTitle(`${type === 'drivers' ? '🏆 Drivers' : '🏁 Constructors'} Championship · ${configuredYear()}`)
-    .setDescription(`**${snapshot.event}**\n**${status}**\n\n${boardText(standings)}`)
-    .setFooter({ text: `MissedTheApex · OpenF1 beta data · ${confirmed ? 'Manually compared with FIA by server admin' : 'Provisional: NOT an official classification'}` })
+    .setDescription(`**${snapshot.event}**\n**${status}**\n\n${text}`)
+    .setFooter({ text: `MissedTheApex · ${published ? 'Jolpica season standings' : 'OpenF1 beta live projections'} · ${confirmed ? 'Manually compared to FIA by admin' : 'Unofficial / not FIA-certified'}` })
     .setTimestamp(new Date(snapshot.at));
-  if (state.fiaDocUrl) embed.addFields({ name: 'FIA Championship Points document', value: `[Read official PDF](${state.fiaDocUrl})` });
+  if (state.fiaDocUrl) embed.addFields({ name: 'FIA Championship Points', value: `[Read official PDF](${state.fiaDocUrl})` });
   return embed;
 }
 
@@ -134,69 +169,99 @@ function isDBReady(bot) {
   return bot.db && !bot.db.getStatus?.().isDegraded && typeof bot.db.get === 'function' && typeof bot.db.set === 'function';
 }
 
-/** Poll a known race only. The optional injected `get` enables offline integration testing. */
-export async function checkF1Championship(bot, { get = openF1, now = Date.now(), allowFia = true } = {}) {
+/** Display latest COMPLETED round immediately, switching to OpenF1 once a race starts.
+ * All versions use the same two Discord message IDs across race weekends.
+ */
+export async function checkF1Championship(bot, { get = openF1, jget = jolpica,
+  now = Date.now(), allowFia = true, force = false } = {}) {
   if (process.env.F1_CHAMPIONSHIP_ENABLED !== 'true' || busy || !bot.isReady()) return 'disabled-or-busy';
   if (!isDBReady(bot)) { logger.warn('[F1 Championship] PostgreSQL unavailable; paused.'); return 'db-unavailable'; }
   const channelId = process.env.F1_CHAMPIONSHIP_CHANNEL_ID;
   if (!/^\d{15,23}$/.test(channelId || '')) { logger.warn('[F1 Championship] Invalid F1_CHAMPIONSHIP_CHANNEL_ID'); return 'no-channel'; }
   busy = true;
   try {
-    const session = await findRace(get, now);
-    if (!session) { logger.debug('[F1 Championship] No current or recent race session.'); return 'no-race'; }
-    const postRace = racePhase(session, now).startsWith('POST');
-    if (postRace && now - lastPostRacePoll < POSTRACE_POLL_MS) return 'postrace-cooldown';
-    if (postRace) lastPostRacePoll = now;
-    const key = Number(session.session_key);
-    if (!Number.isInteger(key)) throw new Error('OpenF1 returned invalid session key');
-    const old = await bot.db.get(boardKey(channelId, key), null);
-    if (old && (old.snapshot?.sessionKey !== key || !old.session)) throw new Error('Stored championship state is invalid; refusing to overwrite');
-    const driversRows = await get(`championship_drivers?session_key=${key}`);
-    const teamsRows = await get(`championship_teams?session_key=${key}`);
-    let driverMetadata = cachedDrivers.get(key);
-    if (!driverMetadata || now - driverMetadata.at > METADATA_CACHE_MS) {
-      driverMetadata = { at: now, data: await get(`drivers?session_key=${key}`) };
-      cachedDrivers.set(key, driverMetadata);
+    const year = configuredYear();
+    let session = null;
+    try { session = await findRace(get, now); }
+    catch (error) { logger.warn(`[F1 Championship] OpenF1 race discovery unavailable; using latest published standings: ${safeHostError(error)}`); }
+    // Before the race actually starts, use completed-round standings, not projected points.
+    const raceStarted = session && now >= Date.parse(session.date_start);
+    const postRace = raceStarted && racePhase(session, now).startsWith('POST');
+    const useOpenF1 = raceStarted;
+    let snapshot;
+    if (useOpenF1) {
+      if (!force && postRace && now - lastPostRacePoll < POSTRACE_POLL_MS) return 'postrace-cooldown';
+      if (postRace) lastPostRacePoll = now;
+      const key = Number(session.session_key);
+      if (!Number.isInteger(key)) throw new Error('OpenF1 returned invalid race session key');
+      const driversRows = await get(`championship_drivers?session_key=${key}`);
+      const teamsRows = await get(`championship_teams?session_key=${key}`);
+      let driverMetadata = cachedDrivers.get(key);
+      if (!driverMetadata || now - driverMetadata.at > METADATA_CACHE_MS) {
+        driverMetadata = { at: now, data: await get(`drivers?session_key=${key}`) };
+        cachedDrivers.set(key, driverMetadata);
+      }
+      snapshot = buildSnapshot({ driversRows, teamsRows, driverMetadata: driverMetadata.data, session, at: now });
+      snapshot.source = 'openf1';
+    } else {
+      if (!force && lastPublishedPoll && now - lastPublishedPoll < PUBLISHED_POLL_MS) return 'published-cooldown';
+      snapshot = await fetchPublished(year, { jget, now });
+      lastPublishedPoll = now;
+      session = {
+        session_key: snapshot.sessionKey, meeting_name: snapshot.event,
+        session_name: 'Race', date_start: '2000-01-01T00:00:00Z',
+        // Historical placeholder: manual FIA review must never mistake it for a live race.
+        date_end: '2000-01-01T02:00:00Z',
+      };
     }
-    const snapshot = buildSnapshot({ driversRows, teamsRows, driverMetadata: driverMetadata.data, session, at: now });
-    const hash = standingsHash(snapshot);
-    const state = old || { session, messages: {}, fiaDocUrl: null, verified: null, snapshot: null, hash: null, displaySignature: null };
+    const key = snapshot.sessionKey;
+    const storedKey = await bot.db.get(channelKey(channelId), null);
+    const old = await bot.db.get(boardKey(channelId, key), null);
+    if (old && (old.snapshot?.sessionKey !== key || !old.session)) throw new Error('Stored championship state invalid');
+    // Migrate the two existing board message IDs across rounds, so the channel stays tidy.
+    const previous = !old && storedKey && Number(storedKey) !== key
+      ? await bot.db.get(boardKey(channelId, storedKey), null) : null;
+    const state = old || {
+      session, messages: { ...(previous?.messages || {}) },
+      fiaDocUrl: null, verified: null, snapshot: null, hash: null, displaySignature: null,
+    };
     state.session = session;
     state.snapshot = snapshot;
+    const hash = standingsHash(snapshot);
     state.hash = hash;
     if (state.verified && state.verified.hash !== hash) {
-      logger.warn('[F1 Championship] Standings changed after manual FIA review; reverting to provisional.');
       state.verified = null;
+      logger.warn('[F1 Championship] Standings changed since FIA review; reverted to provisional.');
     }
-    // FIA is official evidence, not automated proof of a numeric match.
-    if (allowFia && postRace && process.env.F1_CHAMPIONSHIP_FIA_LOOKUP === 'true' && now - lastFiaLookup > 20 * 60000) {
+    if (allowFia && postRace && process.env.F1_CHAMPIONSHIP_FIA_LOOKUP === 'true'
+        && now - lastFiaLookup > 20 * 60000) {
       lastFiaLookup = now;
       try {
         const { docs } = await fetchFiaDocuments();
         const match = docs.find(doc => matchingFiaDoc(doc, session));
-        if (match && state.fiaDocUrl !== match.url) state.fiaDocUrl = match.url;
+        if (match && match.url !== state.fiaDocUrl) state.fiaDocUrl = match.url;
       } catch (error) { logger.warn(`[F1 Championship] FIA lookup unavailable: ${safeHostError(error)}`); }
     }
-    const phase = racePhase(session, now);
+    const phase = snapshot.source === 'jolpica' ? `PUBLISHED ROUND ${snapshot.round}` : racePhase(session, now);
     const signature = `${hash}|${phase}|${state.fiaDocUrl || ''}|${state.verified?.hash || ''}`;
     if (process.env.F1_CHAMPIONSHIP_DRY_RUN !== 'false') {
-      logger.info(`[F1 Championship] DRY RUN: ${snapshot.event}, ${snapshot.drivers.length} drivers, ${snapshot.teams.length} teams, phase=${phase}. No Discord posts.`);
+      logger.info(`[F1 Championship] DRY RUN: ${snapshot.event}, ${snapshot.drivers.length} drivers, ${snapshot.teams.length} teams, ${phase}; no Discord posts.`);
       return 'dry-run';
     }
     if (old?.displaySignature === signature && old.messages?.drivers && old.messages?.teams) return 'unchanged';
     const channel = await bot.channels.fetch(channelId);
-    if (!channel || typeof channel.send !== 'function' || !channel.messages?.fetch) throw new Error('Championship channel cannot send or edit messages');
+    if (!channel || typeof channel.send !== 'function' || !channel.messages?.fetch) throw new Error('Championship channel is not sendable');
     state.messages.drivers = await sendOrEdit(channel, state.messages.drivers, makeEmbed(snapshot, 'drivers', state, now));
-    // Persist first ID before sending second board, reducing duplicates on errors.
+    // Persist the ID immediately to prevent extra messages after a partial failure.
     await bot.db.set(boardKey(channelId, key), state);
     state.messages.teams = await sendOrEdit(channel, state.messages.teams, makeEmbed(snapshot, 'teams', state, now));
     state.displaySignature = signature;
     await bot.db.set(boardKey(channelId, key), state);
     await bot.db.set(channelKey(channelId), key);
-    logger.info(`[F1 Championship] Updated both boards for ${snapshot.event} (${phase}).`);
+    logger.info(`[F1 Championship] Published two standings boards: ${snapshot.event} (${phase}).`);
     return 'updated';
   } catch (error) {
-    logger.warn(`[F1 Championship] Check failed safely: ${safeHostError(error)}`);
+    logger.warn(`[F1 Championship] Update failed safely: ${safeHostError(error)}`);
     return 'error';
   } finally { busy = false; }
 }

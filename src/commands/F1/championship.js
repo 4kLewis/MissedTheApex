@@ -23,9 +23,9 @@ export default {
     if (action === 'status') {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const state = await getChampionshipState(interaction.client);
-      if (!state) return interaction.editReply('No championship boards have been posted yet. They will appear during the next race when live data is available.');
+      if (!state) return interaction.editReply('No championship boards posted yet. Check Railway logs for [F1 Championship]; the tracker now supports between-race published standings.');
       const status = state.verified ? 'Manually cross-checked against FIA' : state.fiaDocUrl ? 'FIA document available, review pending' : 'Provisional';
-      return interaction.editReply(`**${state.snapshot.event}**\nStatus: **${status}**\nDrivers: ${state.snapshot.drivers.length} · Constructors: ${state.snapshot.teams.length}\nLast data: <t:${Math.floor(state.snapshot.at / 1000)}:R>\nSource: OpenF1 beta`);
+      return interaction.editReply(`**${state.snapshot.event}**\nStatus: **${status}**\nDrivers: ${state.snapshot.drivers.length} · Constructors: ${state.snapshot.teams.length}\nLast data: <t:${Math.floor(state.snapshot.at / 1000)}:R>\nSource: ${state.snapshot.source === 'jolpica' ? 'Jolpica completed-round standings' : 'OpenF1 beta live data'}`);
     }
     if (action !== 'verify') return;
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {

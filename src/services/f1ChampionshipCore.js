@@ -94,3 +94,50 @@ export function boardText(rows) {
     return `\`${String(row.position).padStart(2)}\` **${row.name.replace(/[*_~>|]/g, '')}** — **${row.points}** pts (${changeText} race)`;
   }).join('\n').slice(0, 3900);
 }
+
+
+/** Normalize Jolpica's latest COMPLETED round into the same rows as OpenF1.
+ * This is a published standings snapshot, not a live projection or FIA certification.
+ */
+export function buildPublishedStandings({ driverPayload, teamPayload, eventName = '', year, at = Date.now() }) {
+  const dtable = driverPayload?.MRData?.StandingsTable;
+  const ttable = teamPayload?.MRData?.StandingsTable;
+  const dl = dtable?.StandingsLists?.[0];
+  const tl = ttable?.StandingsLists?.[0];
+  const round = Number(dl?.round);
+  if (!Number.isInteger(round) || round < 1 || round > 30 ||
+      Number(tl?.round) !== round || Number(dl?.season) !== year || Number(tl?.season) !== year) {
+    throw new Error('Jolpica season/round mismatch; retaining previous published standings');
+  }
+  if (!Array.isArray(dl.DriverStandings) || !Array.isArray(tl.ConstructorStandings)) {
+    throw new Error('Jolpica response has no completed championship standings');
+  }
+  const drivers = dl.DriverStandings.map((r, index) => {
+    const position = safePosition(r.position);
+    const points = safePoints(r.points);
+    const id = String(r.Driver?.driverId || r.Driver?.permanentNumber || '').slice(0, 70);
+    if (!id || position === null || points === null) return null;
+    const name = cleanName([r.Driver?.givenName, r.Driver?.familyName].filter(Boolean).join(' '), `Driver ${index + 1}`);
+    return { id, name, team: cleanName(r.Constructors?.at(-1)?.name, 'Team unknown'),
+      colour: null, position, points, start: points };
+  }).filter(Boolean).sort((a,b) => a.position-b.position);
+  const teams = tl.ConstructorStandings.map(r => {
+    const position = safePosition(r.position);
+    const points = safePoints(r.points);
+    const id = String(r.Constructor?.constructorId || '').slice(0, 70);
+    if (!id || position === null || points === null) return null;
+    return { id, name: cleanName(r.Constructor?.name, id), position, points, start: points };
+  }).filter(Boolean).sort((a,b) => a.position-b.position);
+  if (drivers.length < MIN_DRIVERS || teams.length < MIN_TEAMS ||
+      new Set(drivers.map(d=>d.id)).size !== drivers.length ||
+      new Set(teams.map(t=>t.id)).size !== teams.length) {
+    throw new Error(`Incomplete/duplicate Jolpica standings (${drivers.length} drivers, ${teams.length} teams)`);
+  }
+  return {
+    version: STATE_VERSION, source: 'jolpica', round, year,
+    // Distinct from OpenF1 session IDs, stable for the round.
+    sessionKey: -(year * 100 + round),
+    event: cleanName(eventName, `After Round ${round}`),
+    sessionEnd: null, at, drivers, teams,
+  };
+}
