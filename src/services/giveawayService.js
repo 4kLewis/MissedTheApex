@@ -1,3 +1,4 @@
+import { randomInt } from 'node:crypto';
 // giveawayService.js
 
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
@@ -238,7 +239,7 @@ export function selectWinners(participants, winnerCount) {
         
         const shuffled = [...uniqueParticipants];
         for (let i = shuffled.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
+            const j = randomInt(i + 1);
             [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
         }
         return shuffled.slice(0, requested);

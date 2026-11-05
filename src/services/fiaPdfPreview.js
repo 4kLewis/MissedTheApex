@@ -11,6 +11,15 @@ const PDF_LIMIT_BYTES = 12 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 7 * 1024 * 1024;
 const FIA_HOSTS = new Set(['fia.com', 'www.fia.com', 'api.fia.com']);
 
+function assertSupportedNode() {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major < 22 || (major === 22 && minor < 13)) {
+    throw new Error(`PDF previews require Node.js >=22.13.0 (running ${process.version}). ` +
+      'The original Dockerfile used Node 20; deploy the included Node 22 Dockerfile.');
+  }
+}
+
+
 function assertFiaPdfUrl(value) {
   const url = new URL(value);
   if (url.protocol !== 'https:' || !FIA_HOSTS.has(url.hostname) ||
@@ -22,6 +31,7 @@ function assertFiaPdfUrl(value) {
 
 /** Return a generated PNG/JPEG Buffer; no intermediate file or PDF upload. */
 export async function renderFiaPdfPreview(pdfBytes, requestedPages = 4) {
+  assertSupportedNode();
   const bytes = Buffer.from(pdfBytes);
   if (bytes.byteLength > PDF_LIMIT_BYTES) throw new Error('PDF exceeds the 12 MB preview limit');
   if (!bytes.subarray(0, 1024).includes(Buffer.from('%PDF-'))) {
@@ -98,7 +108,11 @@ export async function renderFiaPdfPreview(pdfBytes, requestedPages = 4) {
 /** Downloads only URLs discovered on the FIA HTTPS PDF archive. */
 export async function fetchAndRenderFiaPdfPreview(pdfUrl, requestedPages = 4) {
   const safeUrl = assertFiaPdfUrl(pdfUrl);
-  const response = await axios.get(safeUrl, {
+  // Run the version check BEFORE attempting a network download.
+  assertSupportedNode();
+  let response;
+  try {
+    response = await axios.get(safeUrl, {
     responseType: 'arraybuffer',
     timeout: 20_000,
     maxRedirects: 2,
@@ -107,9 +121,22 @@ export async function fetchAndRenderFiaPdfPreview(pdfUrl, requestedPages = 4) {
       Accept: 'application/pdf',
       'User-Agent': 'MissedTheApex-FIA-Documents/1.1 (optional PDF page preview)',
     },
-  });
+    });
+  } catch (error) {
+    const status = error.response?.status;
+    const reason = status ? `HTTP ${status}` : (error.code || error.message);
+    throw new Error(`FIA PDF download failed (${reason}). Check whether the FIA is blocking Railway or the URL is accessible.`, { cause: error });
+  }
   // Limit final redirect origin too; never fetch arbitrary hosts via this feature.
   const finalUrl = response.request?.res?.responseUrl;
-  if (finalUrl) assertFiaPdfUrl(finalUrl);
-  return renderFiaPdfPreview(response.data, requestedPages);
+  if (finalUrl) {
+    try { assertFiaPdfUrl(finalUrl); }
+    catch { throw new Error(`FIA PDF redirects to an unapproved host (${new URL(finalUrl).hostname}); preview blocked for safety.`); }
+  }
+  const bytes = Buffer.from(response.data);
+  if (!bytes.subarray(0, 1024).includes(Buffer.from('%PDF-'))) {
+    const type = response.headers?.['content-type'] || 'unknown content type';
+    throw new Error(`FIA PDF download returned ${type}, not PDF bytes (possible access-denied/HTML response).`);
+  }
+  return renderFiaPdfPreview(bytes, requestedPages);
 }

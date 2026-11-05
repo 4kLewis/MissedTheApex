@@ -9,6 +9,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MAX_COMMANDS = 100;
 const COMMAND_COUNT_WARN_THRESHOLD = 90;
+// Optional migration: preserve legacy !gcreate etc. prefix commands while
+// registering their functionality as /giveaway subcommands instead.
+// Defaults OFF: no Discord slash-command changes until explicitly enabled.
+const COMPACT_GIVEAWAYS = process.env.MTA_COMPACT_GIVEAWAYS === 'true';
+const LEGACY_GIVEAWAY_NAMES = new Set(['gcreate', 'gend', 'gdelete', 'greroll']);
+
+function shouldRegister(name) {
+    return COMPACT_GIVEAWAYS
+        ? !LEGACY_GIVEAWAY_NAMES.has(name)
+        : name !== 'giveaway';
+}
 
 function getSubcommandInfo(commandData) {
     const subcommands = [];
@@ -48,7 +59,7 @@ async function getAllFiles(directory, fileList = []) {
         }
     }
     
-    return fileList;
+    return fileList.sort((a, b) => a.localeCompare(b));
 }
 
 export async function loadCommands(client) {
@@ -132,6 +143,10 @@ function collectCommandPayloads(client) {
         }
 
         const commandName = command.data.name;
+        if (!shouldRegister(commandName)) {
+            logger.info(`Omitting /${commandName} from global registration (legacy prefix execution remains available).`);
+            continue;
+        }
         logger.debug(`Processing command for registration: ${commandName}`);
 
         if (registeredNames.has(commandName)) {
@@ -159,7 +174,7 @@ function validateCommands(commands) {
         if (cmd.name && cmd.name.length > 32) {
             validationErrors.push(`Command ${cmd.name} has name longer than 32 chars: "${cmd.name}" (${cmd.name.length} chars)`);
         }
-        if (cmd.description && cmd.description.length > 110) {
+        if (cmd.description && cmd.description.length > 100) {
             validationErrors.push(`Command ${cmd.name} has description longer than 110 chars: "${cmd.description}" (${cmd.description.length} chars)`);
         }
 
@@ -171,13 +186,13 @@ function validateCommands(commands) {
             if (option.name && option.name.length > 32) {
                 validationErrors.push(`Command ${cmd.name} option ${option.name} has name longer than 32 chars: "${option.name}" (${option.name.length} chars)`);
             }
-            if (option.description && option.description.length > 110) {
+            if (option.description && option.description.length > 100) {
                 validationErrors.push(`Command ${cmd.name} option ${option.name} has description longer than 110 chars: "${option.description}" (${option.description.length} chars)`);
             }
 
             if (option.choices) {
                 for (const choice of option.choices) {
-                    if (choice.name && choice.name.length > 110) {
+                    if (choice.name && choice.name.length > 100) {
                         validationErrors.push(`Command ${cmd.name} option ${option.name} choice ${choice.name} has name longer than 110 chars: "${choice.name}" (${choice.name.length} chars)`);
                     }
                     if (choice.value && choice.value.length > 100) {
@@ -194,7 +209,7 @@ function validateCommands(commands) {
                 if (subOption.name && subOption.name.length > 32) {
                     validationErrors.push(`Command ${cmd.name} subcommand ${option.name} option ${subOption.name} has name longer than 32 chars: "${subOption.name}" (${subOption.name.length} chars)`);
                 }
-                if (subOption.description && subOption.description.length > 110) {
+                if (subOption.description && subOption.description.length > 100) {
                     validationErrors.push(`Command ${cmd.name} subcommand ${option.name} option ${subOption.name} has description longer than 110 chars: "${subOption.description}" (${subOption.description.length} chars)`);
                 }
 
@@ -203,7 +218,7 @@ function validateCommands(commands) {
                 }
 
                 for (const choice of subOption.choices) {
-                    if (choice.name && choice.name.length > 110) {
+                    if (choice.name && choice.name.length > 100) {
                         validationErrors.push(`Command ${cmd.name} subcommand ${option.name} option ${subOption.name} choice ${choice.name} has name longer than 110 chars: "${choice.name}" (${choice.name.length} chars)`);
                     }
                     if (choice.value && choice.value.length > 100) {
@@ -230,10 +245,10 @@ function prepareCommandsForRegistration(commands) {
         return commands;
     }
 
-    logger.warn(`Command count (${commands.length}) exceeds Discord limit (${MAX_COMMANDS}), truncating...`);
-    const truncated = commands.slice(0, MAX_COMMANDS);
-    logger.info(`Truncated to ${truncated.length} commands for registration`);
-    return truncated;
+    // Never silently remove arbitrary commands, especially moderation commands.
+    // This fails registration loudly, leaving the existing Discord command list
+    // unchanged until the operator deliberately consolidates commands.
+    throw new Error(`Cannot register ${commands.length} global slash commands (Discord limit: ${MAX_COMMANDS}). Consolidate commands before deploying.`);
 }
 
 async function registerGlobalCommands(client, clientId, commands, totalSubcommands) {

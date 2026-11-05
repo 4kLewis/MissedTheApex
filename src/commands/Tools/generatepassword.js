@@ -1,4 +1,4 @@
-import { webcrypto as crypto } from 'node:crypto';
+import { generatePassword } from '../../utils/passwordGenerator.js';
 import { getColor } from '../../config/bot.js';
 import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 import { createEmbed, successEmbed, infoEmbed, warningEmbed } from '../../utils/embeds.js';
@@ -52,42 +52,12 @@ export default {
             return;
         }
 
-        const lowercase = 'abcdefghijklmnopqrstuvwxyz';
-        const uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-        const numbers = '0123456789';
-        const symbols = '!@#$%^&*()_+-=[]{}|;:,.<>?';
-
-        let chars = lowercase;
-        if (includeUppercase) chars += uppercase;
-        if (includeNumbers) chars += numbers;
-        if (includeSymbols) chars += symbols;
-
-        let password = '';
-        const randomValues = new Uint32Array(length);
-        crypto.getRandomValues(randomValues);
-
-        for (let i = 0; i < length; i++) {
-            const randomIndex = randomValues[i] % chars.length;
-            password += chars[randomIndex];
-        }
-
-        if (includeUppercase && !/[A-Z]/.test(password)) {
-            const randomIndex = Math.floor(Math.random() * length);
-            const randomUpper = uppercase[Math.floor(Math.random() * uppercase.length)];
-            password = password.substring(0, randomIndex) + randomUpper + password.substring(randomIndex + 1);
-        }
-
-        if (includeNumbers && !/[0-9]/.test(password)) {
-            const randomIndex = Math.floor(Math.random() * length);
-            const randomNumber = numbers[Math.floor(Math.random() * numbers.length)];
-            password = password.substring(0, randomIndex) + randomNumber + password.substring(randomIndex + 1);
-        }
-
-        if (includeSymbols && !/[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/.test(password)) {
-            const randomIndex = Math.floor(Math.random() * length);
-            const randomSymbol = symbols[Math.floor(Math.random() * symbols.length)];
-            password = password.substring(0, randomIndex) + randomSymbol + password.substring(randomIndex + 1);
-        }
+        const password = generatePassword({
+            length,
+            uppercase: includeUppercase,
+            numbers: includeNumbers,
+            symbols: includeSymbols,
+        });
 
         let strength = 'Weak';
         let strengthEmoji = '🔴';

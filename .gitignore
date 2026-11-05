@@ -144,3 +144,9 @@ dist
 # Database backup artifacts
 backups/
 *.dump
+
+# Local FIA preview diagnostic outputs
+fia-preview-test.png
+fia-preview-test.jpg
+fia-preview-live-test.png
+fia-preview-live-test.jpg

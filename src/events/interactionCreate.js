@@ -360,6 +360,10 @@ export default {
             }, interactionTraceContext));
           }
         } else if (interaction.isStringSelectMenu()) {
+          // The F1 supporter dropdown is handled by the standalone listener
+          // registered in f1TeamSelectorService.js. Never acknowledge it twice.
+          if (interaction.customId === 'mta:f1-team-select:v1') return;
+
           const [customId, ...args] = interaction.customId.split(':');
           const selectMenu = client.selectMenus.get(customId);
 

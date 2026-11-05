@@ -9,6 +9,20 @@ const DEFAULT_ARCHIVE =
   'https://api.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2026-2072';
 const MAX_PER_CHECK = 8;
 let checking = false;
+let previewConfigLogged = false;
+
+function previewsEnabled() {
+  return String(process.env.FIA_PDF_PREVIEWS_ENABLED || '').trim().toLowerCase() === 'true';
+}
+
+function logPreviewConfigOnce() {
+  if (previewConfigLogged) return;
+  previewConfigLogged = true;
+  const enabled = previewsEnabled();
+  const pages = Math.max(1, Math.min(4, Number(process.env.FIA_PDF_PREVIEW_PAGES) || 4));
+  logger.info(`[FIA Docs] PDF previews: ${enabled ? 'ENABLED' : 'DISABLED'}; pages=${pages}; Node=${process.version}; ` +
+    (enabled ? 'new documents will attempt image rendering' : 'set FIA_PDF_PREVIEWS_ENABLED=true only if authorised to reproduce previews'));
+}
 
 function sourceUrl() {
   const value = process.env.FIA_DOCUMENTS_URL || DEFAULT_ARCHIVE;
@@ -107,6 +121,7 @@ export async function checkFiaDocuments(client) {
     return;
   }
 
+  logPreviewConfigOnce();
   checking = true;
   try {
     const channel = await client.channels.fetch(channelId);
@@ -138,7 +153,7 @@ export async function checkFiaDocuments(client) {
     for (const doc of pending) {
       const embed = makeEmbed(doc);
       const message = { embeds: [embed], allowedMentions: { parse: [] } };
-      if (process.env.FIA_PDF_PREVIEWS_ENABLED === 'true') {
+      if (previewsEnabled()) {
         try {
           const maxPages = Math.max(1, Math.min(4, Number(process.env.FIA_PDF_PREVIEW_PAGES) || 4));
           const preview = await fetchAndRenderFiaPdfPreview(doc.url, maxPages);
@@ -148,14 +163,17 @@ export async function checkFiaDocuments(client) {
           logger.info(`[FIA Docs] Created ${preview.pages}-page PDF preview for Doc ${doc.number}.`);
         } catch (error) {
           // Keep the existing FIA link notification, even if PDF rendering fails.
-          logger.warn(`[FIA Docs] Doc ${doc.number} preview unavailable: ${error.message}. Sending link-only alert.`);
+          logger.warn(`[FIA Docs] PREVIEW_FAILED Doc ${doc.number} (${doc.event}): ${error.message}. Sending link-only alert.`);
+          if (error.stack) logger.debug(`[FIA Docs] Preview stack: ${error.stack}`);
         }
+      } else {
+        logger.info(`[FIA Docs] PREVIEW_DISABLED Doc ${doc.number}; sending the original PDF link.`);
       }
       try {
         await channel.send(message);
       } catch (sendError) {
         if (!message.files?.length) throw sendError;
-        logger.warn(`[FIA Docs] Image attachment rejected for Doc ${doc.number}: ${sendError.message}. Retrying link-only.`);
+        logger.warn(`[FIA Docs] PREVIEW_UPLOAD_FAILED Doc ${doc.number}: ${sendError.message}. Retrying link-only (check Attach Files permission).`);
         embed.setImage(null);
         await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
       }

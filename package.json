@@ -13,7 +13,8 @@
     "migrate:keys:dry": "node scripts/migrate-keys.js --dry-run",
     "backup:db": "node scripts/backup.js",
     "restore:db": "node scripts/restore.js",
-    "backup:drill": "node scripts/restore-drill.js"
+    "backup:drill": "node scripts/restore-drill.js",
+    "audit:commands": "node scripts/audit-command-registration.js"
   },
   "dependencies": {
     "@discordjs/rest": "^2.6.1",
@@ -33,7 +34,7 @@
     "zod": "^3.25.76"
   },
   "engines": {
-    "node": ">=20.10.0"
+    "node": ">=22.13.0"
   },
   "overrides": {
     "form-data": "^4.0.6",
