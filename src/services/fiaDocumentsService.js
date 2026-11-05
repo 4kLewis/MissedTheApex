@@ -1,6 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { EmbedBuilder } from 'discord.js';
+import { EmbedBuilder, AttachmentBuilder } from 'discord.js';
+import { fetchAndRenderFiaPdfPreview } from './fiaPdfPreview.js';
 import { logger } from '../utils/logger.js';
 
 // Official public FIA archive (2026). Set FIA_DOCUMENTS_URL for future seasons.
@@ -135,7 +136,29 @@ export async function checkFiaDocuments(client) {
     const seen = new Set(existing);
     const pending = docs.filter(doc => !seen.has(doc.url)).reverse().slice(0, MAX_PER_CHECK);
     for (const doc of pending) {
-      await channel.send({ embeds: [makeEmbed(doc)], allowedMentions: { parse: [] } });
+      const embed = makeEmbed(doc);
+      const message = { embeds: [embed], allowedMentions: { parse: [] } };
+      if (process.env.FIA_PDF_PREVIEWS_ENABLED === 'true') {
+        try {
+          const maxPages = Math.max(1, Math.min(4, Number(process.env.FIA_PDF_PREVIEW_PAGES) || 4));
+          const preview = await fetchAndRenderFiaPdfPreview(doc.url, maxPages);
+          const name = `fia-doc-${doc.number}-preview.${preview.extension}`;
+          embed.setImage(`attachment://${name}`);
+          message.files = [new AttachmentBuilder(preview.data, { name })];
+          logger.info(`[FIA Docs] Created ${preview.pages}-page PDF preview for Doc ${doc.number}.`);
+        } catch (error) {
+          // Keep the existing FIA link notification, even if PDF rendering fails.
+          logger.warn(`[FIA Docs] Doc ${doc.number} preview unavailable: ${error.message}. Sending link-only alert.`);
+        }
+      }
+      try {
+        await channel.send(message);
+      } catch (sendError) {
+        if (!message.files?.length) throw sendError;
+        logger.warn(`[FIA Docs] Image attachment rejected for Doc ${doc.number}: ${sendError.message}. Retrying link-only.`);
+        embed.setImage(null);
+        await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+      }
       seen.add(doc.url);
       await client.db.set(storageKey, [...seen]);
       logger.info(`[FIA Docs] Posted: ${doc.event} / Doc ${doc.number} / ${doc.title}`);
