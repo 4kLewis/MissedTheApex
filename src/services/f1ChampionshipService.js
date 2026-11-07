@@ -29,6 +29,8 @@ let cooldownUntil = 0;
 let lastPostRacePoll = 0;
 let lastFiaLookup = 0;
 let lastPublishedPoll = 0;
+let lastChampionshipEmojiFetch = 0;
+let lastChampionshipEmojiGuild = null;
 const PUBLISHED_POLL_MS = 30 * 60_000;
 
 const channelKey = channelId => `${PREFIX}:${channelId}:latest`;
@@ -249,7 +251,36 @@ export async function checkF1Championship(bot, { get = openF1, jget = jolpica,
       } catch (error) { logger.warn(`[F1 Championship] FIA lookup unavailable: ${safeHostError(error)}`); }
     }
     const phase = snapshot.source === 'jolpica' ? `PUBLISHED ROUND ${snapshot.round}` : racePhase(session, now);
-    const cachedChannel = bot.channels.cache?.get(channelId);
+    // Championship emoji refresh: fetch server emojis before comparing board signatures.
+    let cachedChannel = bot.channels.cache?.get(channelId) || null;
+    if (!cachedChannel?.guild && lastChampionshipEmojiGuild) {
+      cachedChannel = { guild: lastChampionshipEmojiGuild };
+    }
+    // Explicitly fetch server emojis rather than depending on the gateway cache.
+    // Refresh at most once per ten minutes while publishing is enabled.
+    if (process.env.F1_CHAMPIONSHIP_DRY_RUN === 'false' && Date.now() - lastChampionshipEmojiFetch >= 10 * 60_000) {
+      lastChampionshipEmojiFetch = Date.now();
+      try {
+        const liveChannel = await bot.channels.fetch(channelId);
+        if (liveChannel?.guild) {
+          lastChampionshipEmojiGuild = liveChannel.guild;
+          cachedChannel = liveChannel;
+        }
+        const guild = cachedChannel?.guild;
+        if (guild?.emojis?.fetch) {
+          await guild.emojis.fetch();
+          const available = [...guild.emojis.cache.values()]
+            .filter(emoji => emoji?.name)
+            .map(emoji => emoji.name)
+            .sort();
+          logger.info('[F1 Championship] Team emoji refresh: ' + available.length + ' server emojis; names: ' + (available.join(', ') || '(none)'));
+        } else {
+          logger.warn('[F1 Championship] Cannot fetch server emojis for the championship channel.');
+        }
+      } catch (error) {
+        logger.warn('[F1 Championship] Emoji fetch failed: ' + safeHostError(error));
+      }
+    }
     const signature = `${hash}|${phase}|${state.fiaDocUrl || ''}|${state.verified?.hash || ''}|board-visuals-v1|${snapshot.raceCountry || ''}|${snapshot.drivers.map(d => d.carNumber || '').join(',')}|${teamEmojiStamp(cachedChannel?.guild)}`;
     if (process.env.F1_CHAMPIONSHIP_DRY_RUN !== 'false') {
       logger.info(`[F1 Championship] DRY RUN: ${snapshot.event}, ${snapshot.drivers.length} drivers, ${snapshot.teams.length} teams, ${phase}; no Discord posts.`);
