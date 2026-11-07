@@ -8,6 +8,7 @@ import { EmbedBuilder } from 'discord.js';
 import { logger } from '../utils/logger.js';
 import { fetchFiaDocuments } from './fiaDocumentsService.js';
 import { buildSnapshot, standingsHash, selectRace, racePhase, boardText, isAllowedFiaPdf, buildPublishedStandings } from './f1ChampionshipCore.js';
+import { championshipBoardRows, raceFlagUrl, teamEmojiStamp } from './f1ChampionshipAppearance.js';
 
 const API = 'https://api.openf1.org';
 const JOLPICA = 'https://api.jolpi.ca/ergast/f1';
@@ -100,16 +101,20 @@ async function fetchPublished(year, { jget = jolpica, now = Date.now() } = {}) {
   ]);
   // Naming the last round is optional. Failure must not hide the standings.
   let eventName = '';
+  let raceCountry = '';
   try {
     const last = await jget(`${year}/last/results.json?limit=1`);
     const race = last?.MRData?.RaceTable?.Races?.[0];
     const round = Number(drivers?.MRData?.StandingsTable?.StandingsLists?.[0]?.round);
-    if (race && Number(race.round) === round) eventName = `${race.raceName} · Round ${round}`;
+    if (race && Number(race.round) === round) {
+      eventName = `${race.raceName} · Round ${round}`;
+      raceCountry = String(race.Circuit?.Location?.country || '').trim();
+    }
   } catch (error) {
     logger.debug(`[F1 Championship] Last-race name unavailable: ${safeHostError(error)}`);
   }
   return buildPublishedStandings({ driverPayload: drivers, teamPayload: teams,
-    eventName, year, at: now });
+    eventName, raceCountry, year, at: now });
 }
 
 async function findRace(get = openF1, now = Date.now()) {
@@ -130,22 +135,23 @@ function matchingFiaDoc(doc, session) {
   return words.some(word => event.includes(word));
 }
 
-function makeEmbed(snapshot, type, state, now) {
+function makeEmbed(snapshot, type, state, now, guild = null) {
   const published = snapshot.source === 'jolpica';
   const phase = published ? `CURRENT PUBLISHED STANDINGS · ROUND ${snapshot.round}` : racePhase(state.session, now);
   const confirmed = state.verified?.hash === standingsHash(snapshot);
   const status = confirmed ? 'FIA CROSS-CHECKED BY SERVER ADMIN' :
     state.fiaDocUrl ? `${phase} · FIA PDF AVAILABLE FOR REVIEW` : phase;
   const standings = type === 'drivers' ? snapshot.drivers : snapshot.teams;
-  const text = published
-    ? standings.map(r => `\`${String(r.position).padStart(2)}\` **${r.name.replace(/[*_~>|]/g,'')}** — **${r.points}** pts`).join('\n').slice(0, 3900)
-    : boardText(standings);
+  const text = championshipBoardRows(standings, type, { guild, live: !published });
   const embed = new EmbedBuilder()
     .setColor(confirmed ? 0x228E68 : !published && phase.startsWith('LIVE') ? 0xF1A722 : 0x387FDB)
     .setTitle(`${type === 'drivers' ? '🏆 Drivers' : '🏁 Constructors'} Championship · ${configuredYear()}`)
     .setDescription(`**${snapshot.event}**\n**${status}**\n\n${text}`)
     .setFooter({ text: `MissedTheApex · ${published ? 'Jolpica season standings' : 'OpenF1 beta live projections'} · ${confirmed ? 'Manually compared to FIA by admin' : 'Unofficial / not FIA-certified'}` })
     .setTimestamp(new Date(snapshot.at));
+  // Top-right PNG; hide it entirely if the host country is unknown.
+  const flag = raceFlagUrl(snapshot.raceCountry);
+  if (flag) embed.setThumbnail(flag);
   if (state.fiaDocUrl) embed.addFields({ name: 'FIA Championship Points', value: `[Read official PDF](${state.fiaDocUrl})` });
   return embed;
 }
@@ -243,7 +249,8 @@ export async function checkF1Championship(bot, { get = openF1, jget = jolpica,
       } catch (error) { logger.warn(`[F1 Championship] FIA lookup unavailable: ${safeHostError(error)}`); }
     }
     const phase = snapshot.source === 'jolpica' ? `PUBLISHED ROUND ${snapshot.round}` : racePhase(session, now);
-    const signature = `${hash}|${phase}|${state.fiaDocUrl || ''}|${state.verified?.hash || ''}`;
+    const cachedChannel = bot.channels.cache?.get(channelId);
+    const signature = `${hash}|${phase}|${state.fiaDocUrl || ''}|${state.verified?.hash || ''}|board-visuals-v1|${snapshot.raceCountry || ''}|${snapshot.drivers.map(d => d.carNumber || '').join(',')}|${teamEmojiStamp(cachedChannel?.guild)}`;
     if (process.env.F1_CHAMPIONSHIP_DRY_RUN !== 'false') {
       logger.info(`[F1 Championship] DRY RUN: ${snapshot.event}, ${snapshot.drivers.length} drivers, ${snapshot.teams.length} teams, ${phase}; no Discord posts.`);
       return 'dry-run';
@@ -251,10 +258,10 @@ export async function checkF1Championship(bot, { get = openF1, jget = jolpica,
     if (old?.displaySignature === signature && old.messages?.drivers && old.messages?.teams) return 'unchanged';
     const channel = await bot.channels.fetch(channelId);
     if (!channel || typeof channel.send !== 'function' || !channel.messages?.fetch) throw new Error('Championship channel is not sendable');
-    state.messages.drivers = await sendOrEdit(channel, state.messages.drivers, makeEmbed(snapshot, 'drivers', state, now));
+    state.messages.drivers = await sendOrEdit(channel, state.messages.drivers, makeEmbed(snapshot, 'drivers', state, now, channel.guild));
     // Persist the ID immediately to prevent extra messages after a partial failure.
     await bot.db.set(boardKey(channelId, key), state);
-    state.messages.teams = await sendOrEdit(channel, state.messages.teams, makeEmbed(snapshot, 'teams', state, now));
+    state.messages.teams = await sendOrEdit(channel, state.messages.teams, makeEmbed(snapshot, 'teams', state, now, channel.guild));
     state.displaySignature = signature;
     await bot.db.set(boardKey(channelId, key), state);
     await bot.db.set(channelKey(channelId), key);
@@ -291,10 +298,11 @@ export async function markFiaReviewed(bot, pdfUrl, adminId) {
   await bot.db.set(stateKey, state);
   const channel = await bot.channels.fetch(channelId);
   if (!channel?.messages?.fetch) throw new Error('Channel not available for editing');
-  state.messages.drivers = await sendOrEdit(channel, state.messages.drivers, makeEmbed(state.snapshot, 'drivers', state, Date.now()));
+  state.messages.drivers = await sendOrEdit(channel, state.messages.drivers, makeEmbed(state.snapshot, 'drivers', state, Date.now(), channel.guild));
   await bot.db.set(stateKey, state);
-  state.messages.teams = await sendOrEdit(channel, state.messages.teams, makeEmbed(state.snapshot, 'teams', state, Date.now()));
-  state.displaySignature = `${hash}|${racePhase(state.session)}|${state.fiaDocUrl}|${hash}`;
+  state.messages.teams = await sendOrEdit(channel, state.messages.teams, makeEmbed(state.snapshot, 'teams', state, Date.now(), channel.guild));
+  const reviewPhase = state.snapshot.source === 'jolpica' ? `PUBLISHED ROUND ${state.snapshot.round}` : racePhase(state.session);
+  state.displaySignature = `${hash}|${reviewPhase}|${state.fiaDocUrl || ''}|${hash}|board-visuals-v1|${state.snapshot.raceCountry || ''}|${state.snapshot.drivers.map(d => d.carNumber || '').join(',')}|${teamEmojiStamp(channel.guild)}`;
   await bot.db.set(stateKey, state);
   return state;
 }

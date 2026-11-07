@@ -55,7 +55,7 @@ export function buildSnapshot({ driversRows, teamsRows, driverMetadata = [], ses
   }
   return { version: STATE_VERSION, sessionKey: Number(session.session_key),
     event: cleanName(session.meeting_name || session.country_name || session.location, 'Grand Prix'),
-    sessionEnd: session.date_end || null, at, drivers, teams };
+    sessionEnd: session.date_end || null, raceCountry: cleanName(session.country_name, ''), at, drivers, teams };
 }
 export function standingsHash(snapshot) {
   const data = [snapshot.sessionKey,
@@ -99,7 +99,7 @@ export function boardText(rows) {
 /** Normalize Jolpica's latest COMPLETED round into the same rows as OpenF1.
  * This is a published standings snapshot, not a live projection or FIA certification.
  */
-export function buildPublishedStandings({ driverPayload, teamPayload, eventName = '', year, at = Date.now() }) {
+export function buildPublishedStandings({ driverPayload, teamPayload, eventName = '', raceCountry = '', year, at = Date.now() }) {
   const dtable = driverPayload?.MRData?.StandingsTable;
   const ttable = teamPayload?.MRData?.StandingsTable;
   const dl = dtable?.StandingsLists?.[0];
@@ -119,6 +119,7 @@ export function buildPublishedStandings({ driverPayload, teamPayload, eventName 
     if (!id || position === null || points === null) return null;
     const name = cleanName([r.Driver?.givenName, r.Driver?.familyName].filter(Boolean).join(' '), `Driver ${index + 1}`);
     return { id, name, team: cleanName(r.Constructors?.at(-1)?.name, 'Team unknown'),
+      carNumber: /^\d{1,3}$/.test(String(r.Driver?.permanentNumber || '')) && Number(r.Driver.permanentNumber) > 0 ? Number(r.Driver.permanentNumber) : null,
       colour: null, position, points, start: points };
   }).filter(Boolean).sort((a,b) => a.position-b.position);
   const teams = tl.ConstructorStandings.map(r => {
@@ -137,7 +138,7 @@ export function buildPublishedStandings({ driverPayload, teamPayload, eventName 
     version: STATE_VERSION, source: 'jolpica', round, year,
     // Distinct from OpenF1 session IDs, stable for the round.
     sessionKey: -(year * 100 + round),
-    event: cleanName(eventName, `After Round ${round}`),
+    event: cleanName(eventName, `After Round ${round}`), raceCountry: cleanName(raceCountry, ''),
     sessionEnd: null, at, drivers, teams,
   };
 }
